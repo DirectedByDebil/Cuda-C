@@ -1,0 +1,34 @@
+CC = /usr/local/cuda-13.2/bin/nvcc 
+CFLAGS = -c -O2 -arch=native
+LDFLAGS = 
+SOURCES = main.cu
+OBJECTS = $(SOURCES:.cu=.o)
+EXECUTABLE = cuda_1
+
+all: $(EXECUTABLE)
+	
+$(EXECUTABLE): $(OBJECTS)
+	$(CC) $(LDFLAGS) $(OBJECTS) -o $@
+
+main.o: main.cu
+	$(CC) $(CFLAGS) $< -o $@
+
+clean:
+	rm -rf $(OBJECTS) $(EXECUTABLE)
+
+debug: CFLAGS = -c -O0 -g -G
+debug: clean all
+
+fast: CFLAGS = -c -O3 -arch=native -lineinfo
+fast: clean all
+
+run-debug: debug
+	./$(EXECUTABLE)
+
+run-release: all
+	./$(EXECUTABLE)
+
+run-fast: fast
+	./$(EXECUTABLE)
+
+.PHONY: all clean debug fast run-debug run-release run-fast
