@@ -1,6 +1,6 @@
 CC = /usr/local/cuda-13.2/bin/nvcc 
 CFLAGS = -c -O2 -arch=native
-LDFLAGS = 
+LDFLAGS = -lGL -lGLU -lglut
 SOURCES = main.cu
 OBJECTS = $(SOURCES:.cu=.o)
 EXECUTABLE = cuda_1
