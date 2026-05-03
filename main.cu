@@ -2,6 +2,14 @@
 
 #include "example/common/book.h"
 #include "example/common/cpu_bitmap.h"
+#include "example/common/cpu_anim.h"
+
+#define N 20
+#define DIM 1000
+
+#define DIM 1024
+#define PI 3.1415926535897932f
+
 
 #pragma region Chapter 3
 
@@ -107,8 +115,6 @@ void filterDevices()
 
 #pragma region Chapter 4
 
-#define N 20
-
 __global__ void addVectors(int* a, int* b, int* c)
 {
     int tid = blockIdx.x;
@@ -157,7 +163,6 @@ void parallelExample()
     cudaFree(dev_c);
 }
 
-#define DIM 1000
 
 struct cuComplex
 {
@@ -240,11 +245,254 @@ void fractalExample()
 
 #pragma endregion
 
+#pragma region Chapter 5
+
+//========== test blocks and threads ================
+
+__global__ void addVectors_threads(int* a, int* b, int* c)
+{
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    while (tid < N)
+    {
+        c[tid] = a[tid] + b[tid];
+        tid += blockDim.x * gridDim.x;
+    }
+}
+
+void parallelExample_threads()
+{
+    int a[N];
+    int b[N];
+    int c[N];
+    int *dev_a;
+    int *dev_b;
+    int *dev_c;
+
+    HANDLE_ERROR( cudaMalloc( (void**)&dev_a, N*sizeof(int) ) );
+    HANDLE_ERROR( cudaMalloc( (void**)&dev_b, N*sizeof(int) ) );
+    HANDLE_ERROR( cudaMalloc( (void**)&dev_c, N*sizeof(int) ) );
+
+    for (int i = 0; i < N; i++)
+    {
+        a[i] = -i;
+        b[i] = i*i;
+    }
+    
+
+    HANDLE_ERROR( cudaMemcpy( dev_a, a, N*sizeof(int), cudaMemcpyHostToDevice) );
+    HANDLE_ERROR( cudaMemcpy( dev_b, b, N*sizeof(int), cudaMemcpyHostToDevice) );
+    
+    
+    addVectors_threads<<<128,128>>> (dev_a, dev_b, dev_c);
+    
+    HANDLE_ERROR( cudaMemcpy( c, dev_c, N*sizeof(int), cudaMemcpyDeviceToHost) );
+
+    for (int i = 0; i < N; i++)
+    {
+        printf("%d + %d = %d\n", a[i], b[i], c[i]);
+    }
+
+
+    cudaFree(dev_a);
+    cudaFree(dev_b);
+    cudaFree(dev_c);
+}
+
+//========== test animation ================
+
+struct DataBlock
+{
+    unsigned char *dev_bitmap;
+    CPUAnimBitmap *bitmap;
+};
+
+void cleanup (DataBlock *d)
+{
+    cudaFree(d->dev_bitmap);
+}
+
+__global__ void animationKernel(unsigned char *ptr, int ticks)
+{
+	int x = threadIdx.x + blockIdx.x * blockDim.x;
+	int y = threadIdx.y + blockIdx.y * blockDim.y;
+	int offset = x + y * blockDim.x * gridDim.x;
+	
+	// now calculate the value at that position
+	float fx = x - DIM/2;
+	float fy = y - DIM/2;
+	float d = sqrtf( fx * fx + fy * fy );
+	
+	unsigned char grey = (unsigned char) (128.0f + 127.0f * cos(d/10.0f - ticks / 7.0f) / (d / 10.0f + 1.0f));
+	
+	ptr[offset*4 + 0] = grey;
+	ptr[offset*4 + 1] = grey;
+	ptr[offset*4 + 2] = grey;
+	ptr[offset*4 + 3] = 255;
+}
+
+void generate_frame(DataBlock *d, int ticks)
+{
+    dim3 blocks(DIM/16, DIM/16);
+    dim3 threads(16, 16);
+    
+    animationKernel<<<blocks,threads>>> (d->dev_bitmap, ticks);
+
+    HANDLE_ERROR( cudaMemcpy( d->bitmap->get_ptr(), d->dev_bitmap, d->bitmap->image_size(), cudaMemcpyDeviceToHost));
+}
+
+void testAnimation()
+{
+    DataBlock data;
+    CPUAnimBitmap bitmap(DIM, DIM, &data);
+    data.bitmap = &bitmap;
+
+    HANDLE_ERROR( cudaMalloc( (void**)&data.dev_bitmap, bitmap.image_size()));
+
+    bitmap.anim_and_exit( (void (*)(void*,int))generate_frame, (void (*)(void*))cleanup );
+}
+
+//========== test dot product ================
+
+#define imin(a,b) (a<b?a:b)
+
+const int M = 33 * 1024;
+const int threadsPerBlock = 256;
+const int blocksPerGrid = imin(32, (M+threadsPerBlock-1)/threadsPerBlock);
+
+__global__ void dot (float *a, float *b, float *c)
+{
+    __shared__ float cache[threadsPerBlock];
+    int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    int cacheIndex = threadIdx.x;
+    float temp = 0;
+    while (tid < M)
+    {
+        temp += a[tid] * b[tid];
+        tid += blockDim.x * gridDim.x;
+    }
+
+    cache[cacheIndex] = temp;
+
+    __syncthreads();
+
+    int i = blockDim.x/2;
+    while (i != 0)
+    {
+        if (cacheIndex < i)
+            cache[cacheIndex] += cache[cacheIndex + i];
+        __syncthreads();
+        i /= 2;
+    }
+
+    if (cacheIndex == 0)
+        c[blockIdx.x] = cache[0];
+}
+
+void testDotProduct()
+{
+    float *a, *b, c, *partial_c;
+    float *dev_a, *dev_b, *dev_partial_c;
+
+    a = (float *)malloc(M*sizeof(float));
+    b = (float *)malloc(M*sizeof(float));
+    partial_c = (float *)malloc(blocksPerGrid*sizeof(float));
+
+	HANDLE_ERROR(cudaMalloc((void**)&dev_a, M*sizeof(float)));
+	HANDLE_ERROR(cudaMalloc((void**)&dev_b, M*sizeof(float)));
+	HANDLE_ERROR(cudaMalloc((void**)&dev_partial_c, blocksPerGrid*sizeof(float)));
+	
+	for(int i=0; i<M; i++) {
+		a[i] = i;
+		b[i] = i*2;
+	}
+	
+	
+	HANDLE_ERROR(cudaMemcpy(dev_a, a, M*sizeof(float), cudaMemcpyHostToDevice));
+	HANDLE_ERROR(cudaMemcpy(dev_b, b, M*sizeof(float), cudaMemcpyHostToDevice));
+	
+	dot<<<blocksPerGrid, threadsPerBlock>>>(dev_a, dev_b, dev_partial_c);
+	
+	HANDLE_ERROR(cudaMemcpy(partial_c, dev_partial_c, blocksPerGrid*sizeof(float), cudaMemcpyDeviceToHost));
+	
+	c = 0;
+	for(int i=0; i<blocksPerGrid; i++) {
+		c += partial_c[i];
+	}
+	
+	#define sum_squares(x) (x*(x+1)*(2*x+1)/6)
+	printf("Does GPU value %.6g = %.6g?\n", c, 2*sum_squares((float)(M-1)));
+	
+	cudaFree(dev_a);
+	cudaFree(dev_b);
+	cudaFree(dev_partial_c);
+	
+	free(a);
+	free(b);
+	free(partial_c);
+}
+
+//========== test shared raster ================
+
+__global__ void bitmapKernel( unsigned char *ptr ) {
+
+	int x = threadIdx.x + blockIdx.x * blockDim.x;
+	int y = threadIdx.y + blockIdx.y * blockDim.y;
+	int offset = x + y * blockDim.x * gridDim.x;
+
+	__shared__ float shared[16][16];
+	
+
+	const float period = 128.0f;
+	
+	shared[threadIdx.x][threadIdx.y] = 
+			255 * (sinf(x*2.0f*PI/ period) + 1.0f) *
+                (sinf(y*2.0f*PI/ period) + 1.0f) / 4.0f;
+	
+	__syncthreads();
+	
+	ptr[offset*4 + 0] = 0;
+	ptr[offset*4 + 1] = shared[15-threadIdx.x][15-threadIdx.y];
+	ptr[offset*4 + 2] = 0;
+	ptr[offset*4 + 3] = 255;
+}
+
+
+void testSharedRaster()
+{
+    CPUBitmap bitmap( DIM, DIM );
+	unsigned char *dev_bitmap;
+
+	HANDLE_ERROR( cudaMalloc( (void**)&dev_bitmap, bitmap.image_size() ) );
+
+	dim3 grids( DIM/16, DIM/16 );
+	dim3 threads(16,16);
+	
+	bitmapKernel<<<grids,threads>>>( dev_bitmap );
+
+	HANDLE_ERROR( cudaMemcpy( bitmap.get_ptr(), 
+                dev_bitmap, 
+                bitmap.image_size(), 
+                cudaMemcpyDeviceToHost ) );
+	bitmap.display_and_exit();
+
+	HANDLE_ERROR( cudaFree( dev_bitmap ) );
+}
+
+#pragma endregion
 
 
 int main (int argc, char* argv[])
 {
-    fractalExample();
+    //========== laba 3 ================
+    
+    //parallelExample_threads();
+    testAnimation();
+    //testDotProduct();
+    //estSharedRaster();
+    
+    
+    //========== laba 4 ================
+    //========== laba 5 ================
 
     return 0;
 }
